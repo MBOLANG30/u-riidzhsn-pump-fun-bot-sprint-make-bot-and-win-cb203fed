@@ -26,7 +26,7 @@ export const PARAMS = {
   windowTrades: 40,
   cliffWindowSlots: 20,
   minTradesInWindow: 3,
-  cliffPct: 0.45, // current price <= (1 - cliffPct) * price at window start
+  cliffPct: 0.37, // current price <= (1 - cliffPct) * price at window start
   recoverPct: 0.04, // current price >= (1 + recoverPct) * window min price
   minTrades: 10,
   maxAgeSlots: 3600, // slots after the coin's first trade
@@ -41,7 +41,7 @@ export const PARAMS = {
   stopLoss: 0.05,
   trailArm: 0.25, // arm the trailing stop once the peak is this high
   trailPct: 0.1, // sell once the price falls this far below the peak
-  timeStopSlots: 150,
+  timeStopSlots: 300,
   cooldownSlots: 400, // per mint, between entries
   // Fallback pace: if the bot is behind on coins once it has seen a good
   // share of the window's mints, loosen the entry. Thresholds are counts of
