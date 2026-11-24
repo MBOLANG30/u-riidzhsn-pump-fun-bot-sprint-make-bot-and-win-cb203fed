@@ -24,7 +24,7 @@ export const PARAMS = {
   // a short window ago (point-to-point cliff), have turned off its window
   // low, and show net-positive buy flow since that low.
   windowTrades: 40,
-  cliffWindowSlots: 20,
+  cliffWindowSlots: 30,
   minTradesInWindow: 3,
   cliffPct: 0.37, // current price <= (1 - cliffPct) * price at window start
   recoverPct: 0.04, // current price >= (1 + recoverPct) * window min price
