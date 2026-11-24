@@ -23,26 +23,26 @@ export const PARAMS = {
   // FLUSH_WINDOW_SLOTS slots, so a slow bleed over thousands of slots does
   // not count — only a fast flush followed by a bounce.
   windowTrades: 40,
-  flushWindowSlots: 60,
-  minTradesInWindow: 4,
-  flushPct: 0.3, // min price in the window <= (1 - flushPct) * max price
-  recoverPct: 0.06, // current price >= (1 + recoverPct) * window min price
-  flowTrades: 6, // net buy SOL over the last N trades must beat sells 1.5x
-  flowRatio: 1.5,
+  flushWindowSlots: 20,
+  minTradesInWindow: 3,
+  flushPct: 0.37, // min price in the window <= (1 - flushPct) * max price
+  recoverPct: 0.04, // current price >= (1 + recoverPct) * window min price
+  flowTrades: 6, // buy SOL over the last N trades must beat sell SOL
+  flowRatio: 1,
   minTrades: 10,
-  maxAgeSlots: 1800, // slots after the coin's first trade
+  maxAgeSlots: 3600, // slots after the coin's first trade
   minReserveSol: 5,
-  maxReserveSol: 100,
-  stakeSol: 0.1, // target stake
-  stakeBpsOfReserve: 80, // stake is at most 0.8% of the real SOL reserve
+  maxReserveSol: 60,
+  stakeSol: 0.2, // target stake
+  stakeBpsOfReserve: 95, // stake is at most 0.95% of the real SOL reserve
   minStakeSol: 0.02,
   // Exits.
-  scaleOutAt: 0.18, // sell half the tokens here
+  scaleOutAt: 0.2, // sell half the tokens here
   takeProfit: 0.3, // sell the rest here
   stopLoss: 0.1,
-  trailArm: 0.18, // arm the trailing stop once the peak is this high
+  trailArm: 0.15, // arm the trailing stop once the peak is this high
   trailPct: 0.08, // sell once the price falls this far below the peak
-  timeStopSlots: 200,
+  timeStopSlots: 150,
   cooldownSlots: 400, // per mint, between entries
   // Fallback pace: if the bot is behind on coins once it has seen a good
   // share of the window's mints, loosen the entry. Thresholds are counts of
