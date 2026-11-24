@@ -2,12 +2,13 @@
 //
 // Idea (my own design): memecoin curves flush hard and fast, then often
 // bounce. Instead of chasing coins that already ran up (most give the gains
-// back), this bot waits for a sharp flush inside a short slot window, then
-// buys only once fresh buy flow shows the flush is turning — a bounce
-// entry, not a momentum chase. Exits are staged: half the position is sold
-// into the first +18% so a winner banks something even if it rolls over, and
-// the rest runs with a take-profit, a stop and a trailing stop, plus a short
-// time stop so dead coins do not sit in the book.
+// back), this bot waits for a coin that is still deeply depressed versus
+// where it traded a short window ago, then buys only once the price has
+// turned off its window low and fresh buy flow after that low is net
+// positive — a bounce entry, not a momentum chase. Exits are staged: half
+// the position is sold into the first +20% so a winner banks something even
+// if it rolls over, and the rest runs with a take-profit, a stop and a
+// trailing stop, plus a short time stop so dead coins do not sit in the book.
 //
 // Everything is deterministic: no clock, no environment, no unseeded
 // randomness. All decisions come from the hello + the batches the harness
@@ -19,16 +20,14 @@ export const BPS = 10_000n;
 // ---------------------------------------------------------------- parameters
 // Tuned on the dev window with the real grader (grade-local), not a backtest.
 export const PARAMS = {
-  // Entry: the flush is measured over the coin's own trades in the last
-  // FLUSH_WINDOW_SLOTS slots, so a slow bleed over thousands of slots does
-  // not count — only a fast flush followed by a bounce.
+  // Entry: the coin must still be deeply depressed versus where it traded
+  // a short window ago (point-to-point cliff), have turned off its window
+  // low, and show net-positive buy flow since that low.
   windowTrades: 40,
-  flushWindowSlots: 20,
+  cliffWindowSlots: 20,
   minTradesInWindow: 3,
-  flushPct: 0.37, // min price in the window <= (1 - flushPct) * max price
+  cliffPct: 0.37, // current price <= (1 - cliffPct) * price at window start
   recoverPct: 0.04, // current price >= (1 + recoverPct) * window min price
-  flowTrades: 6, // buy SOL over the last N trades must beat sell SOL
-  flowRatio: 1,
   minTrades: 10,
   maxAgeSlots: 3600, // slots after the coin's first trade
   minReserveSol: 5,
@@ -211,7 +210,7 @@ export class Strategy {
     if (this.mintsSeen >= s1 && this.coinsEntered < p.fallbackStage1Coins) {
       return { flush: p.fallbackStage1Flush, recover: p.fallbackStage1Recover };
     }
-    return { flush: p.flushPct, recover: p.recoverPct };
+    return { flush: p.cliffPct, recover: p.recoverPct };
   }
 
   private curveFor(mint: string, slot: number): Curve {
@@ -393,34 +392,40 @@ export class Strategy {
       if (slot - c.lastEntrySlot < PARAMS.cooldownSlots) continue;
       if (c.realSol < PARAMS.minReserveSol || c.realSol > PARAMS.maxReserveSol) continue;
       if (this.openCount() >= this.hello.caps.max_open_positions) continue;
-      // Flush over the coin's own trades in the last flushWindowSlots
-      // slots: a fast flush, not a slow bleed.
+      // Cliff: the coin's own trades in the last cliffWindowSlots slots.
+      // pStart is the price at the window's start; the coin must still be
+      // at least cliffPct below it (a depressed price, not a bounce that
+      // already ran), and must have turned up off the window low.
       let hi = 0;
       let lo = Infinity;
+      let lowSlot = -1;
+      let pStart = 0;
       let inWindow = 0;
       for (let i = c.history.length - 1; i >= 0; i--) {
         const t = c.history[i]!;
-        if (t.slot < slot - PARAMS.flushWindowSlots) break;
+        if (t.slot < slot - PARAMS.cliffWindowSlots) break;
         inWindow++;
+        pStart = t.price; // ends as the earliest trade in the window
         if (t.price > hi) hi = t.price;
-        if (t.price < lo) lo = t.price;
+        if (t.price < lo) {
+          lo = t.price;
+          lowSlot = t.slot;
+        }
       }
-      if (inWindow < PARAMS.minTradesInWindow || hi <= 0 || lo === Infinity) continue;
-      if (lo / hi - 1 > -th.flush) continue; // no flush deep enough
+      if (inWindow < PARAMS.minTradesInWindow || hi <= 0 || lo === Infinity || pStart <= 0) continue;
+      if (c.lastPrice / pStart - 1 > -th.flush) continue; // not depressed enough
       if (c.lastPrice / lo - 1 < th.recover) continue; // not bouncing off the low
-      // Fresh buy flow: the latest trade is a buy and buy SOL over the last
-      // few trades beats sell SOL by the flow ratio.
-      const h = c.history;
-      if (h.length === 0 || !h[h.length - 1]!.isBuy) continue;
-      let buySol = 0;
-      let sellSol = 0;
-      const start = Math.max(0, h.length - PARAMS.flowTrades);
-      for (let i = start; i < h.length; i++) {
-        const t = h[i]!;
-        if (t.isBuy) buySol += t.sol;
-        else sellSol += t.sol;
+      // Post-low flow: signed SOL of the trades after the window low must be
+      // net positive — buyers are returning after the flush.
+      let flow = 0;
+      let buysAfterLow = 0;
+      for (let i = c.history.length - 1; i >= 0; i--) {
+        const t = c.history[i]!;
+        if (t.slot <= lowSlot) break;
+        flow += t.isBuy ? t.sol : -t.sol;
+        if (t.isBuy) buysAfterLow++;
       }
-      if (buySol < PARAMS.flowRatio * sellSol) continue;
+      if (flow <= 0 || buysAfterLow === 0) continue;
       // Size: the smaller of the target stake and 0.8% of the real reserve
       // (the harness caps buys at 1% of real reserve per reply per mint).
       const capLamports = (BigInt(Math.floor(c.realSol * 1e9)) * BigInt(PARAMS.stakeBpsOfReserve)) / BPS;
