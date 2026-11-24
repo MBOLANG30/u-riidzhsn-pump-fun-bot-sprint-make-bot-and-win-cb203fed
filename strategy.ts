@@ -38,7 +38,7 @@ export const PARAMS = {
   // Exits.
   scaleOutAt: 0.3, // sell half the tokens here
   takeProfit: 0.5, // sell the rest here
-  stopLoss: 0.1,
+  stopLoss: 0.07,
   trailArm: 0.25, // arm the trailing stop once the peak is this high
   trailPct: 0.1, // sell once the price falls this far below the peak
   timeStopSlots: 150,
