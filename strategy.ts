@@ -36,11 +36,11 @@ export const PARAMS = {
   stakeBpsOfReserve: 95, // stake is at most 0.95% of the real SOL reserve
   minStakeSol: 0.02,
   // Exits.
-  scaleOutAt: 0.2, // sell half the tokens here
-  takeProfit: 0.3, // sell the rest here
+  scaleOutAt: 0.3, // sell half the tokens here
+  takeProfit: 0.5, // sell the rest here
   stopLoss: 0.1,
-  trailArm: 0.15, // arm the trailing stop once the peak is this high
-  trailPct: 0.08, // sell once the price falls this far below the peak
+  trailArm: 0.25, // arm the trailing stop once the peak is this high
+  trailPct: 0.1, // sell once the price falls this far below the peak
   timeStopSlots: 150,
   cooldownSlots: 400, // per mint, between entries
   // Fallback pace: if the bot is behind on coins once it has seen a good
