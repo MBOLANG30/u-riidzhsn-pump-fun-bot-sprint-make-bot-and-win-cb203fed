@@ -27,12 +27,12 @@ export const PARAMS = {
   cliffWindowSlots: 20,
   minTradesInWindow: 3,
   cliffPct: 0.37, // current price <= (1 - cliffPct) * price at window start
-  recoverPct: 0.06, // current price >= (1 + recoverPct) * window min price
+  recoverPct: 0.04, // current price >= (1 + recoverPct) * window min price
   minTrades: 10,
   maxAgeSlots: 3600, // slots after the coin's first trade
   minReserveSol: 5,
   maxReserveSol: 60,
-  stakeSol: 0.2, // target stake
+  stakeSol: 0.3, // target stake
   stakeBpsOfReserve: 95, // stake is at most 0.95% of the real SOL reserve
   minStakeSol: 0.02,
   // Exits.
