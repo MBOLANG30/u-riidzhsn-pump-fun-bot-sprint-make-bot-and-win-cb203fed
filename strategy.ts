@@ -26,7 +26,7 @@ export const PARAMS = {
   windowTrades: 40,
   cliffWindowSlots: 30,
   minTradesInWindow: 3,
-  cliffPct: 0.3, // current price <= (1 - cliffPct) * price at window start
+  cliffPct: 0.37, // current price <= (1 - cliffPct) * price at window start
   recoverPct: 0.04, // current price >= (1 + recoverPct) * window min price
   minTrades: 10,
   maxAgeSlots: 3600, // slots after the coin's first trade

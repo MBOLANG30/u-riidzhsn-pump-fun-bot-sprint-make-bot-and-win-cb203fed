@@ -13,6 +13,7 @@ import { Strategy } from './strategy.ts';
 import type { BatchMsg, HelloMsg, OrderOut } from './strategy.ts';
 
 const strategy = new Strategy();
+let lastSeq = -1;
 
 async function main(): Promise<void> {
   let buffer = '';
@@ -49,6 +50,10 @@ function handleLine(line: string): boolean {
   }
   if (type === 'batch') {
     const batch = msg as BatchMsg;
+    if (batch.seq <= lastSeq) {
+      throw new Error(`batch seq ${batch.seq} does not follow ${lastSeq}`);
+    }
+    lastSeq = batch.seq;
     const orders: OrderOut[] = strategy.onBatch(batch);
     const reply = JSON.stringify({ type: 'reply', seq: batch.seq, orders });
     process.stdout.write(`${reply}\n`);
