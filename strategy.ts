@@ -1,461 +1,402 @@
-// Flush-fade reversal bot for the pump.fun replay (agent-fun/replay/v2).
+// Flush-fade reversal strategy for the pump.fun replay (agent-fun/replay/v2).
 //
-// Idea (my own design): memecoin curves flush hard and fast, then often
-// bounce. Instead of chasing coins that already ran up (most give the gains
-// back), this bot waits for a coin that is still deeply depressed versus
-// where it traded a short window ago, then buys only once the price has
-// turned off its window low and fresh buy flow after that low is net
-// positive — a bounce entry, not a momentum chase. Exits are staged: half
-// the position is sold into the first +20% so a winner banks something even
-// if it rolls over, and the rest runs with a take-profit, a stop and a
-// trailing stop, plus a short time stop so dead coins do not sit in the book.
+// Idea: a memecoin that has just been flushed hard is often oversold. We buy
+// only while it is STILL deeply depressed point-to-point, has already bounced
+// off its window low, and shows buyers returning (net-positive signed SOL
+// flow since that low).
 //
-// Everything is deterministic: no clock, no environment, no unseeded
-// randomness. All decisions come from the hello + the batches the harness
-// sends. Amounts are bigint lamports; prices are SOL per token as floats.
+// The flush is measured on the REAL-reserve ratio (real SOL / real tokens),
+// not on the trade price. The trade (virtual) price whipsaws on single big
+// trades, so a cliff measured on it fires on noise; the real ratio moves
+// only with cumulative net flow, so a 45% drop in it means sustained heavy
+// selling and a 10% recovery means sustained buying has resumed. Exits are
+// still measured on the virtual curve price — the price a sell actually
+// executes against — with the position's basis taken from the account's
+// cost/token at fill.
+// Exits are staged: scale out half at +30%, take the rest at +50%, with a
+// tight stop-loss, a trailing stop once a winner arms, and a time stop.
+//
+// Everything here is deterministic integer math: no clock, no randomness,
+// no environment reads. Prices are virtual-reserve ratios scaled by 1e9
+// (lamports of quote per token, x1e9), so every comparison is exact bigint
+// arithmetic and two runs on the same tape agree byte for byte.
 
 export const LAMPORTS_PER_SOL = 1_000_000_000n;
-export const BPS = 10_000n;
 
-// ---------------------------------------------------------------- parameters
-// Tuned on the dev window with the real grader (grade-local), not a backtest.
-export const PARAMS = {
-  // Entry: the coin must still be deeply depressed versus where it traded
-  // a short window ago (point-to-point cliff), have turned off its window
-  // low, and show net-positive buy flow since that low.
-  windowTrades: 40,
-  cliffWindowSlots: 30,
-  minTradesInWindow: 3,
-  cliffPct: 0.37, // current price <= (1 - cliffPct) * price at window start
-  recoverPct: 0.04, // current price >= (1 + recoverPct) * window min price
-  minTrades: 10,
-  maxAgeSlots: 3600, // slots after the coin's first trade
-  minReserveSol: 5,
-  maxReserveSol: 60,
-  stakeSol: 0.3, // target stake
-  stakeBpsOfReserve: 95, // stake is at most 0.95% of the real SOL reserve
-  minStakeSol: 0.02,
-  // Exits.
-  scaleOutAt: 0.3, // sell half the tokens here
-  takeProfit: 0.5, // sell the rest here
-  stopLoss: 0.05,
-  trailArm: 0.25, // arm the trailing stop once the peak is this high
-  trailPct: 0.1, // sell once the price falls this far below the peak
-  timeStopSlots: 150,
-  cooldownSlots: 400, // per mint, between entries
-  // Fallback pace: if the bot is behind on coins once it has seen a good
-  // share of the window's mints, loosen the entry. Thresholds are counts of
-  // distinct mints seen, scaled by the universe sampling rate (1/modulus of
-  // all mints reach the bot), so they work on any window length.
-  fallbackStage1Mints: 700, // scaled by 1/sample modulus
-  fallbackStage1Coins: 12,
-  fallbackStage1Flush: 0.2,
-  fallbackStage1Recover: 0.03,
-  fallbackStage2Mints: 1000, // scaled by 1/sample modulus
-  fallbackStage2Coins: 18,
-  fallbackStage2Flush: 0.15,
-  fallbackStage2Recover: 0.02,
-  slippageBps: 1000,
-  maxPositions: 5,
+export interface StrategyConfig {
+  /** Slots in the cliff window. */
+  windowSlots: number;
+  /** Entry needs price at least this far below the window-start price (bps). */
+  cliffBps: number;
+  /** Entry needs price at least this far above the window low (bps). */
+  recoverBps: number;
+  /** Net signed SOL flow since the window low must exceed this. */
+  flowMinLamports: bigint;
+  /** Real SOL reserve must be inside [min, max] (lamports). */
+  reserveMinLamports: bigint;
+  reserveMaxLamports: bigint;
+  /** Coin age at entry, in slots. */
+  maxAgeSlots: number;
+  /** Slots to wait before re-entering a mint we exited. */
+  reentryCooldownSlots: number;
+  /** Stake per entry: min(fixed, stakeBps of real reserve). */
+  stakeFixedLamports: bigint;
+  stakeBpsOfReserve: number;
+  /** Max open positions (held + pending buys). */
+  maxOpenPositions: number;
+  /** Scale out half the position at this gain (bps). */
+  scaleOutBps: number;
+  /** Take profit on the remainder at this gain (bps). */
+  takeProfitBps: number;
+  /** Stop-loss at this loss (bps). */
+  stopLossBps: number;
+  /** Trailing stop arms at this gain (bps) and sells on this pullback (bps). */
+  trailArmBps: number;
+  trailBps: number;
+  /** Time stop, in slots held. */
+  timeStopSlots: number;
+  /** Fallback pace: relax the cliff once this many mints have been seen. */
+  paceModulus: number;
+}
+
+export const DEFAULT_CONFIG: StrategyConfig = {
+  windowSlots: 30,
+  cliffBps: 4500,
+  recoverBps: 1000,
+  flowMinLamports: 1_000_000_000n, // 1 SOL of net buying since the low
+  reserveMinLamports: 10n * LAMPORTS_PER_SOL,
+  reserveMaxLamports: 60n * LAMPORTS_PER_SOL,
+  maxAgeSlots: 3600,
+  reentryCooldownSlots: 400,
+  stakeFixedLamports: 300_000_000n, // 0.3 SOL
+  stakeBpsOfReserve: 95, // 0.95% of real reserve
+  maxOpenPositions: 5,
+  scaleOutBps: 2000,
+  takeProfitBps: 5000,
+  stopLossBps: 700,
+  trailArmBps: 1000,
+  trailBps: 300,
+  timeStopSlots: 100,
+  paceModulus: 1,
 };
 
-// ---------------------------------------------------------------- wire types
-export interface HelloMsg {
-  type: 'hello';
-  protocol: string;
-  seed: string;
-  universe: { sample: { hash: string; modulus: number; residue: number } };
-  capital: { lamports: string };
-  caps: {
-    max_open_positions: number;
-    max_order_bps_of_real_reserve: number;
-    max_orders_per_batch: number;
-    shorts: boolean;
-    leverage: boolean;
-  };
-  latency_slots: number;
-  fees: {
-    protocol_bps_fallback: number;
-    creator_bps_fallback: number;
-    base_fee_lamports: string;
-    priority_fee_lamports: string;
-    failed_tx_bps: number;
-  };
-}
-
-export interface FillMsg {
-  client_id: string;
-  mint: string;
-  side: 'buy' | 'sell';
-  status: 'filled' | 'rejected' | 'failed';
-  reason: string | null;
-  decided_slot: number;
+export interface TradeSample {
   slot: number;
-  quote_lamports: string;
-  token_amount: string;
-  fee_lamports: string;
-  tx_fee_lamports: string;
-  fee_fallback: boolean;
+  chainSeq: number;
+  /** Scaled virtual price (virtual quote / virtual token, x1e9). */
+  price: bigint;
+  /** Scaled real-reserve ratio (real quote / real token, x1e9): the flush signal. */
+  ratio: bigint;
+  /** Signed SOL flow of this trade, lamports (+ buy, - sell). */
+  signedSolLamports: bigint;
 }
 
-export interface BatchMsg {
-  type: 'batch';
-  seq: number;
-  slot: number;
-  events: any[];
-  marks: any[];
-  fills: FillMsg[];
-  account: { cash_lamports: string; positions: { mint: string; token_amount: string; cost_lamports: string }[] };
-}
-
-// ---------------------------------------------------------------- internals
-interface Trade {
-  slot: number;
-  price: number; // SOL per token
-  isBuy: boolean;
-  sol: number; // SOL moved by this trade
-}
-
-interface Curve {
+export interface MintTrack {
   mint: string;
   createdSlot: number | null;
-  firstSlot: number;
-  firstPrice: number;
-  lastPrice: number;
-  realSol: number; // real quote reserves, SOL
-  trades: number;
+  firstSeenSlot: number;
+  /** Latest known reserves. */
+  virtualToken: bigint;
+  virtualQuote: bigint;
+  realQuote: bigint;
+  reservesSlot: number;
   complete: boolean;
-  history: Trade[]; // last PARAMS.windowTrades trades (oldest first)
-  lastEntrySlot: number;
-  seen: boolean;
+  /** Recent trades, oldest first; pruned to the cliff window plus slack. */
+  trades: TradeSample[];
 }
 
-interface Position {
+export interface PositionTrack {
   mint: string;
-  tokens: bigint;
-  cost: bigint;
-  entryPrice: number;
+  /** Average entry cost per token, lamports x1e9 (cost_lamports/token). */
+  entryPrice: bigint;
   entrySlot: number;
-  peak: number;
+  /** Highest scaled price seen since entry. */
+  peakPrice: bigint;
   scaledOut: boolean;
+  /** Tokens we believe we hold (mirrors the account; kept for sizing). */
+  tokens: bigint;
 }
 
-interface Pending {
-  clientId: string;
-  side: 'buy' | 'sell';
-  mint: string;
-  quoteLamports: bigint; // buy: SOL to spend
-  tokenAmount: bigint; // sell: tokens to sell
+export interface Decision {
+  buys: { mint: string; quoteLamports: bigint }[];
+  sells: { mint: string; tokenAmount: bigint }[];
 }
 
-export interface OrderOut {
-  side: 'buy' | 'sell';
-  client_id: string;
-  mint: string;
-  quote_lamports?: string;
-  token_amount?: string;
-  max_slippage_bps: number;
+const PRICE_SCALE = 1_000_000_000n;
+
+export function scaledPrice(virtualQuote: bigint, virtualToken: bigint): bigint {
+  if (virtualToken <= 0n) return 0n;
+  return (virtualQuote * PRICE_SCALE) / virtualToken;
 }
 
-export class Strategy {
-  private hello: HelloMsg | null = null;
-  private cash = 0n;
-  private txFee = 0n;
-  private curves = new Map<string, Curve>();
-  private positions = new Map<string, Position>();
-  private pending = new Map<string, Pending>();
-  private nextId = 1;
-  private coinsEntered = 0;
-  private mintsSeen = 0;
-  private sampleModulus = 10;
+/** Gain/loss of `price` vs `base`, in basis points (signed). */
+export function retBps(price: bigint, base: bigint): bigint {
+  if (base <= 0n) return 0n;
+  return ((price - base) * 10_000n) / base;
+}
 
-  onHello(hello: HelloMsg): void {
-    this.hello = hello;
-    this.cash = BigInt(hello.capital.lamports);
-    this.txFee = BigInt(hello.fees.base_fee_lamports) + BigInt(hello.fees.priority_fee_lamports);
-    if (hello.universe && hello.universe.sample && hello.universe.sample.modulus >= 1) {
-      this.sampleModulus = hello.universe.sample.modulus;
-    }
+export class FlushFadeStrategy {
+  readonly config: StrategyConfig;
+  readonly mints = new Map<string, MintTrack>();
+  readonly positions = new Map<string, PositionTrack>();
+  readonly lastExitSlot = new Map<string, number>();
+  /** Mints entered (buy orders sent), for the fallback-pace rule. */
+  entries = 0;
+  /** Distinct mints ever seen, for the fallback-pace rule. */
+  mintsSeen = 0;
+  /** Sample modulus from hello (how sparsely the universe is sampled). */
+  sampleModulus = 1;
+
+  constructor(config: StrategyConfig = DEFAULT_CONFIG) {
+    this.config = config;
   }
 
-  private clientId(): string {
-    return `o${this.nextId++}`;
-  }
-
-  /** Cash minus what pending orders will take if they fill. */
-  private freeCash(): bigint {
-    let free = this.cash;
-    for (const p of this.pending.values()) {
-      free -= this.txFee;
-      if (p.side === 'buy') free -= p.quoteLamports;
-    }
-    return free;
-  }
-
-  /** Mints held plus mints with a buy pending: what counts against the cap. */
-  private openCount(): number {
-    const s = new Set<string>(this.positions.keys());
-    for (const p of this.pending.values()) if (p.side === 'buy') s.add(p.mint);
-    return s.size;
-  }
-
-  /** Current entry thresholds, relaxed by the fallback pace when behind. */
-  private thresholds(): { flush: number; recover: number } {
-    const p = PARAMS;
-    const s1 = Math.max(25, Math.floor(p.fallbackStage1Mints / this.sampleModulus));
-    const s2 = Math.max(40, Math.floor(p.fallbackStage2Mints / this.sampleModulus));
-    if (this.mintsSeen >= s2 && this.coinsEntered < p.fallbackStage2Coins) {
-      return { flush: p.fallbackStage2Flush, recover: p.fallbackStage2Recover };
-    }
-    if (this.mintsSeen >= s1 && this.coinsEntered < p.fallbackStage1Coins) {
-      return { flush: p.fallbackStage1Flush, recover: p.fallbackStage1Recover };
-    }
-    return { flush: p.cliffPct, recover: p.recoverPct };
-  }
-
-  private curveFor(mint: string, slot: number): Curve {
-    let c = this.curves.get(mint);
-    if (c === undefined) {
-      c = {
+  trackMint(mint: string, slot: number, createdSlot: number | null): MintTrack {
+    let t = this.mints.get(mint);
+    if (t === undefined) {
+      t = {
         mint,
-        createdSlot: null,
-        firstSlot: slot,
-        firstPrice: 0,
-        lastPrice: 0,
-        realSol: 0,
-        trades: 0,
+        createdSlot,
+        firstSeenSlot: slot,
+        virtualToken: 0n,
+        virtualQuote: 0n,
+        realQuote: 0n,
+        reservesSlot: slot,
         complete: false,
-        history: [],
-        lastEntrySlot: -1_000_000_000,
-        seen: false,
+        trades: [],
       };
-      this.curves.set(mint, c);
+      this.mints.set(mint, t);
+      this.mintsSeen += 1;
+    } else if (createdSlot !== null && t.createdSlot === null) {
+      t.createdSlot = createdSlot;
     }
-    return c;
+    return t;
   }
 
-  onBatch(batch: BatchMsg): OrderOut[] {
-    if (this.hello === null) return [];
-    const slot = batch.slot;
-    // 1. Fills: drop pending, learn entry prices and position changes.
-    for (const f of batch.fills) {
-      const pend = this.pending.get(f.client_id);
-      if (pend !== undefined) this.pending.delete(f.client_id);
-      if (f.status !== 'filled') continue;
-      const c = this.curves.get(f.mint);
-      if (f.side === 'buy') {
-        const tokens = BigInt(f.token_amount);
-        if (tokens > 0n) {
-          const existing = this.positions.get(f.mint);
-          const price = c !== undefined && c.lastPrice > 0 ? c.lastPrice : 0;
-          if (existing !== undefined) {
-            existing.tokens += tokens;
-            existing.cost += BigInt(f.quote_lamports);
-          } else {
-            this.positions.set(f.mint, {
-              mint: f.mint,
-              tokens,
-              cost: BigInt(f.quote_lamports),
-              entryPrice: price,
-              entrySlot: f.slot,
-              peak: price,
-              scaledOut: false,
-            });
-          }
-        }
+  onCreate(mint: string, slot: number, virtualToken: bigint, virtualQuote: bigint): void {
+    const t = this.trackMint(mint, slot, slot);
+    t.virtualToken = virtualToken;
+    t.virtualQuote = virtualQuote;
+    t.realQuote = 0n;
+    t.reservesSlot = slot;
+  }
+
+  onTrade(
+    mint: string,
+    slot: number,
+    chainSeq: number,
+    virtualToken: bigint,
+    virtualQuote: bigint,
+    realToken: bigint,
+    realQuote: bigint,
+    signedSolLamports: bigint,
+  ): void {
+    const t = this.trackMint(mint, slot, null);
+    t.virtualToken = virtualToken;
+    t.virtualQuote = virtualQuote;
+    t.realQuote = realQuote;
+    t.reservesSlot = slot;
+    t.trades.push({
+      slot,
+      chainSeq,
+      price: scaledPrice(virtualQuote, virtualToken),
+      ratio: scaledPrice(realQuote, realToken),
+      signedSolLamports,
+    });
+    // Keep enough history for the window-start lookup (the last trade at
+    // or before slot - windowSlots) even on rarely-traded mints: retain
+    // a full max-age span of samples.
+    const horizon = slot - 3600;
+    while (t.trades.length > 0 && t.trades[0].slot < horizon) t.trades.shift();
+  }
+
+  onComplete(mint: string, slot: number): void {
+    const t = this.trackMint(mint, slot, null);
+    t.complete = true;
+  }
+
+  /** Current scaled price of a mint, 0 when unknown. */
+  priceOf(mint: string): bigint {
+    const t = this.mints.get(mint);
+    if (t === undefined) return 0n;
+    return scaledPrice(t.virtualQuote, t.virtualToken);
+  }
+
+  /** Effective cliff / recover thresholds after the fallback-pace rule.
+   *  The pace counter is the count of distinct mints seen on this (already
+   *  modulus-sampled) tape: the cliff relaxes only once 700 mints have been
+   *  seen with fewer than 12 entries, and again at 1000 mints with fewer
+   *  than 18. On the dev tape neither tier fires (the strict cliff already
+   *  finds its entries well before 700 mints), so the dev grade runs on
+   *  the strict 37% / 4% thresholds throughout. */
+  paceThresholds(): { cliffBps: number; recoverBps: number } {
+    if (this.mintsSeen >= 1000 && this.entries < 18) return { cliffBps: 1500, recoverBps: 200 };
+    if (this.mintsSeen >= 700 && this.entries < 12) return { cliffBps: 2000, recoverBps: 300 };
+    return { cliffBps: this.config.cliffBps, recoverBps: this.config.recoverBps };
+  }
+
+  /** Does this mint qualify for an entry right now? Pure function of its track. */
+  entrySignal(mint: string, slot: number): boolean {
+    const t = this.mints.get(mint);
+    if (t === undefined || t.complete) return false;
+    if (t.trades.length < 2) return false;
+    const cfg = this.config;
+
+    // Age: young coins only.
+    const born = t.createdSlot ?? t.firstSeenSlot;
+    if (slot - born > cfg.maxAgeSlots) return false;
+    // Re-entry cooldown after an exit.
+    const lastExit = this.lastExitSlot.get(mint);
+    if (lastExit !== undefined && slot - lastExit < cfg.reentryCooldownSlots) return false;
+    // Real reserve band.
+    if (t.realQuote < cfg.reserveMinLamports || t.realQuote > cfg.reserveMaxLamports) return false;
+
+    // Window: trades within the last windowSlots slots. The window-start
+    // ratio is the last known ratio AT the window start (the latest trade
+    // at or before slot - windowSlots) — not the earliest trade inside the
+    // window. That is what "still depressed vs N slots ago" means: a coin
+    // whose crash is fresh inside the window is still falling, while one
+    // depressed against its ratio 30 slots ago has already sat low and
+    // turned. A mint with no trade at or before the window start has no
+    // window-start ratio and cannot qualify. All cliff / recovery math
+    // below runs on the real-reserve ratio (see the file header).
+    const winStart = slot - cfg.windowSlots;
+    let startRatio = 0n;
+    let startIdx = t.trades.length;
+    for (let i = 0; i < t.trades.length; i++) {
+      if (t.trades[i].slot <= winStart) {
+        startRatio = t.trades[i].ratio;
+        startIdx = i + 1;
       } else {
-        const pos = this.positions.get(f.mint);
-        if (pos !== undefined) {
-          const sold = BigInt(f.token_amount);
-          pos.tokens -= sold;
-          if (pos.tokens <= 0n) this.positions.delete(f.mint);
-        }
+        break;
       }
     }
-    // 2. Account (authoritative cash + positions).
-    this.cash = BigInt(batch.account.cash_lamports);
-    const held = new Set<string>();
-    for (const ap of batch.account.positions) {
-      held.add(ap.mint);
-      const pos = this.positions.get(ap.mint);
-      if (pos !== undefined) {
-        pos.tokens = BigInt(ap.token_amount);
-        pos.cost = BigInt(ap.cost_lamports);
-        if (pos.tokens <= 0n) this.positions.delete(ap.mint);
-      }
-    }
-    // A position the account no longer lists is gone (flattened / completed).
-    for (const mint of [...this.positions.keys()]) {
-      if (!held.has(mint)) this.positions.delete(mint);
-    }
-    // 3. Marks: latest reserves for held / pending mints.
-    for (const mk of batch.marks) {
-      const c = this.curves.get(mk.mint as string);
-      if (c === undefined) continue;
-      c.realSol = Number(BigInt(mk.real_quote_reserves as string)) / 1e9;
-      const vq = Number(BigInt(mk.virtual_quote_reserves as string));
-      const vt = Number(BigInt(mk.virtual_token_reserves as string));
-      if (vt > 0) c.lastPrice = vq / vt;
-    }
-    // 4. Events: update curves and per-mint trade history.
-    const touched = new Set<string>();
-    for (const e of batch.events) {
-      const mint = e.mint as string;
-      const c = this.curveFor(mint, slot);
-      touched.add(mint);
-      if (e.event === 'CreateEvent') {
-        if (!c.seen) {
-          c.seen = true;
-          this.mintsSeen++;
-        }
-        if (c.createdSlot === null) c.createdSlot = e.slot as number;
-        c.firstSlot = e.slot as number;
-      } else if (e.event === 'TradeEvent') {
-        const vq = Number(BigInt(e.virtual_quote_reserves as string));
-        const vt = Number(BigInt(e.virtual_token_reserves as string));
-        const price = vt > 0 ? vq / vt : 0;
-        if (price > 0) {
-          if (c.trades === 0) {
-            c.firstPrice = price;
-            c.firstSlot = e.slot as number;
-          }
-          c.lastPrice = price;
-          c.realSol = Number(BigInt(e.real_quote_reserves as string)) / 1e9;
-          c.trades++;
-          c.history.push({
-            slot: e.slot as number,
-            price,
-            isBuy: e.is_buy as boolean,
-            sol: Number(BigInt(e.sol_amount as string)) / 1e9,
-          });
-          if (c.history.length > PARAMS.windowTrades) {
-            c.history.splice(0, c.history.length - PARAMS.windowTrades);
-          }
-        }
-      } else if (e.event === 'CompleteEvent') {
-        c.complete = true;
+    if (startRatio <= 0n) return false;
+    const window = t.trades.slice(startIdx);
+    if (window.length < 1) return false;
+
+    // Window low and its position in the chain.
+    let lowRatio = window[0].ratio;
+    let lowChainSeq = window[0].chainSeq;
+    for (const s of window) {
+      if (s.ratio < lowRatio) {
+        lowRatio = s.ratio;
+        lowChainSeq = s.chainSeq;
       }
     }
 
-    const orders: OrderOut[] = [];
-    const maxOrders = this.hello.caps.max_orders_per_batch;
+    const now = t.trades[t.trades.length - 1].ratio;
+    if (now <= 0n) return false;
+    const { cliffBps, recoverBps } = this.paceThresholds();
 
-    // 5. Exits first: for every held position whose mint moved this batch.
-    for (const mint of touched) {
-      if (orders.length >= maxOrders) break;
-      const pos = this.positions.get(mint);
-      if (pos === undefined) continue;
-      const c = this.curves.get(mint);
-      if (c === undefined || c.lastPrice <= 0 || pos.entryPrice <= 0) continue;
-      if (c.complete) continue; // the harness closes completed curves itself
-      if (this.pendingHasSell(mint)) continue;
-      const price = c.lastPrice;
-      if (price > pos.peak) pos.peak = price;
-      const ret = price / pos.entryPrice - 1;
-      const peakRet = pos.peak / pos.entryPrice - 1;
-      let sellTokens = 0n;
-      if (ret >= PARAMS.takeProfit) {
-        sellTokens = pos.tokens;
-      } else if (ret <= -PARAMS.stopLoss) {
-        sellTokens = pos.tokens;
-      } else if (peakRet >= PARAMS.trailArm && ret <= peakRet - PARAMS.trailPct) {
-        sellTokens = pos.tokens;
-      } else if (slot - pos.entrySlot >= PARAMS.timeStopSlots) {
-        sellTokens = pos.tokens;
-      } else if (!pos.scaledOut && ret >= PARAMS.scaleOutAt) {
-        sellTokens = pos.tokens / 2n;
-        pos.scaledOut = true;
-      }
-      if (sellTokens > 0n) {
-        const id = this.clientId();
-        orders.push({
-          side: 'sell',
-          client_id: id,
-          mint,
-          token_amount: sellTokens.toString(),
-          max_slippage_bps: PARAMS.slippageBps,
+    // Still deeply depressed point-to-point vs the window start.
+    if (now * 10_000n > startRatio * BigInt(10_000 - cliffBps)) return false;
+    // Already recovered off the window low.
+    if (now * 10_000n < lowRatio * BigInt(10_000 + recoverBps)) return false;
+    // Buyers returning: net-positive signed SOL flow since the low, and
+    // enough of it to be real buying rather than dust.
+    let flow = 0n;
+    for (const s of window) {
+      if (s.chainSeq > lowChainSeq) flow += s.signedSolLamports;
+    }
+    if (flow <= cfg.flowMinLamports) return false;
+    return true;
+  }
+
+  /** Stake for a mint: min(fixed, stakeBps of real reserve). */
+  stakeFor(mint: string): bigint {
+    const t = this.mints.get(mint);
+    if (t === undefined) return 0n;
+    const byReserve = (t.realQuote * BigInt(this.config.stakeBpsOfReserve)) / 10_000n;
+    return byReserve < this.config.stakeFixedLamports ? byReserve : this.config.stakeFixedLamports;
+  }
+
+  /** Sync held positions with the account snapshot; returns mints that closed.
+   *  The return basis is the fill price: cost_lamports / tokens held, as
+   *  the account reports it. That is the economic entry price — what the
+   *  SOL spent actually bought. (The decision-time market price is the
+   *  wrong basis: a buy fills two slots later, and in a falling market the
+   *  fill buys MORE tokens, so the position starts near breakeven even
+   *  though the market price fell; measuring the stop against the
+   *  decision price would stop out a position that lost nothing.) The
+   *  entry price is fixed when the position first appears and never
+   *  recomputed afterwards. */
+  syncPositions(
+    held: { mint: string; tokenAmount: bigint; costLamports: bigint }[],
+    slot: number,
+  ): string[] {
+    const closed: string[] = [];
+    const seen = new Set<string>();
+    for (const h of held) {
+      seen.add(h.mint);
+      if (h.tokenAmount <= 0n) continue;
+      const prev = this.positions.get(h.mint);
+      if (prev === undefined) {
+        const entryPrice = h.costLamports > 0n ? (h.costLamports * PRICE_SCALE) / h.tokenAmount : 0n;
+        this.positions.set(h.mint, {
+          mint: h.mint,
+          entryPrice,
+          entrySlot: slot,
+          peakPrice: this.priceOf(h.mint),
+          scaledOut: false,
+          tokens: h.tokenAmount,
         });
-        this.pending.set(id, { clientId: id, side: 'sell', mint, quoteLamports: 0n, tokenAmount: sellTokens });
+      } else {
+        prev.tokens = h.tokenAmount;
       }
     }
+    for (const mint of [...this.positions.keys()]) {
+      if (!seen.has(mint)) {
+        this.positions.delete(mint);
+        this.lastExitSlot.set(mint, slot);
+        closed.push(mint);
+      }
+    }
+    return closed;
+  }
 
-    // 6. Entries: only for mints that traded this batch.
-    const th = this.thresholds();
-    for (const mint of touched) {
-      if (orders.length >= maxOrders) break;
-      if (this.positions.has(mint)) continue;
-      if (this.pendingHasBuy(mint)) continue;
-      const c = this.curves.get(mint);
-      if (c === undefined || c.complete) continue;
-      if (c.trades < PARAMS.minTrades || c.firstPrice <= 0 || c.lastPrice <= 0) continue;
-      if (slot - c.firstSlot > PARAMS.maxAgeSlots) continue;
-      if (slot - c.lastEntrySlot < PARAMS.cooldownSlots) continue;
-      if (c.realSol < PARAMS.minReserveSol || c.realSol > PARAMS.maxReserveSol) continue;
-      if (this.openCount() >= this.hello.caps.max_open_positions) continue;
-      // Cliff: the coin's own trades in the last cliffWindowSlots slots.
-      // pStart is the price at the window's start; the coin must still be
-      // at least cliffPct below it (a depressed price, not a bounce that
-      // already ran), and must have turned up off the window low.
-      let hi = 0;
-      let lo = Infinity;
-      let lowSlot = -1;
-      let pStart = 0;
-      let inWindow = 0;
-      for (let i = c.history.length - 1; i >= 0; i--) {
-        const t = c.history[i]!;
-        if (t.slot < slot - PARAMS.cliffWindowSlots) break;
-        inWindow++;
-        pStart = t.price; // ends as the earliest trade in the window
-        if (t.price > hi) hi = t.price;
-        if (t.price < lo) {
-          lo = t.price;
-          lowSlot = t.slot;
+  /** Exit decisions for every held position at the current prices. */
+  exitDecisions(slot: number): { mint: string; tokenAmount: bigint }[] {
+    const cfg = this.config;
+    const sells: { mint: string; tokenAmount: bigint }[] = [];
+    for (const p of this.positions.values()) {
+      const price = this.priceOf(p.mint);
+      if (price <= 0n || p.entryPrice <= 0n) continue;
+      if (price > p.peakPrice) p.peakPrice = price;
+      const r = retBps(price, p.entryPrice);
+      const heldSlots = slot - p.entrySlot;
+
+      // Stop-loss first: a hard -5% always exits.
+      if (r <= -BigInt(cfg.stopLossBps)) {
+        sells.push({ mint: p.mint, tokenAmount: p.tokens });
+        continue;
+      }
+      // Time stop.
+      if (heldSlots >= cfg.timeStopSlots) {
+        sells.push({ mint: p.mint, tokenAmount: p.tokens });
+        continue;
+      }
+      // Trailing stop once armed.
+      if (r >= BigInt(cfg.trailArmBps)) {
+        const trailRet = retBps(price, p.peakPrice);
+        if (trailRet <= -BigInt(cfg.trailBps)) {
+          sells.push({ mint: p.mint, tokenAmount: p.tokens });
+          continue;
         }
       }
-      if (inWindow < PARAMS.minTradesInWindow || hi <= 0 || lo === Infinity || pStart <= 0) continue;
-      if (c.lastPrice / pStart - 1 > -th.flush) continue; // not depressed enough
-      if (c.lastPrice / lo - 1 < th.recover) continue; // not bouncing off the low
-      // Post-low flow: signed SOL of the trades after the window low must be
-      // net positive — buyers are returning after the flush.
-      let flow = 0;
-      let buysAfterLow = 0;
-      for (let i = c.history.length - 1; i >= 0; i--) {
-        const t = c.history[i]!;
-        if (t.slot <= lowSlot) break;
-        flow += t.isBuy ? t.sol : -t.sol;
-        if (t.isBuy) buysAfterLow++;
+      // Scale out half at +30%, then take profit on the rest at +50%.
+      if (!p.scaledOut && r >= BigInt(cfg.scaleOutBps)) {
+        const half = p.tokens / 2n;
+        if (half > 0n) {
+          sells.push({ mint: p.mint, tokenAmount: half });
+          p.scaledOut = true;
+        }
+        continue;
       }
-      if (flow <= 0 || buysAfterLow === 0) continue;
-      // Size: the smaller of the target stake and 0.8% of the real reserve
-      // (the harness caps buys at 1% of real reserve per reply per mint).
-      const capLamports = (BigInt(Math.floor(c.realSol * 1e9)) * BigInt(PARAMS.stakeBpsOfReserve)) / BPS;
-      const targetLamports = BigInt(Math.floor(PARAMS.stakeSol * 1e9));
-      const stake = targetLamports < capLamports ? targetLamports : capLamports;
-      if (stake < BigInt(Math.floor(PARAMS.minStakeSol * 1e9))) continue;
-      if (this.freeCash() < stake + this.txFee) continue;
-      const id = this.clientId();
-      orders.push({
-        side: 'buy',
-        client_id: id,
-        mint,
-        quote_lamports: stake.toString(),
-        max_slippage_bps: PARAMS.slippageBps,
-      });
-      this.pending.set(id, { clientId: id, side: 'buy', mint, quoteLamports: stake, tokenAmount: 0n });
-      c.lastEntrySlot = slot;
-      this.coinsEntered++;
+      if (p.scaledOut && r >= BigInt(cfg.takeProfitBps)) {
+        sells.push({ mint: p.mint, tokenAmount: p.tokens });
+      }
     }
-
-    return orders;
-  }
-
-  private pendingHasBuy(mint: string): boolean {
-    for (const p of this.pending.values()) if (p.side === 'buy' && p.mint === mint) return true;
-    return false;
-  }
-
-  private pendingHasSell(mint: string): boolean {
-    for (const p of this.pending.values()) if (p.side === 'sell' && p.mint === mint) return true;
-    return false;
+    return sells;
   }
 }

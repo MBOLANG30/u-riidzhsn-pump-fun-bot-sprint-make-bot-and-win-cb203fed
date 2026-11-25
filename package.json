@@ -1,1 +1,1 @@
-{"description":"Deterministic paper-trading bot for pump.fun bonding curves: buys sharp flushes once fresh buy flow turns, then stages exits with a scale-out, take-profit, trailing stop and time stop.","engines":{"node":">=22.18"},"license":"MIT","main":"main.ts","name":"u-riidzhsn-pump-fun-bot-sprint-make-bot-and-win-cb203fed","scripts":{"start":"node main.ts"},"type":"module","version":"1.0.0"}
+{"name":"pump-fun-flush-fade-bot","private":true,"type":"module","version":"1.0.0"}
